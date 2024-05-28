@@ -6,6 +6,7 @@ from torchvision import models, transforms
 import tensorflow as tf
 import tensorflow_datasets as tfds
 import numpy as np
+from sklearn.model_selection import train_test_split
 
 
 # Save the trained model
@@ -53,9 +54,35 @@ class TensorFlow300WLPDataset(Dataset):
             image = self.transform(image)
         return image, landmarks
 
-# Load dataset using TensorFlow Datasets
-data, info = tfds.load('the300w_lp', with_info=True, as_supervised=True)
-data = list(data.map(tf_to_torch))  # Convert entire dataset to PyTorch format
+def load_300w_train():
+    """
+    Loads the 300W-LP dataset, splits it into training and validation sets.
+
+    Returns
+    -------
+    train_x, train_y, valid_x, valid_y : tuple
+        Tuple containing training and validation sets for features and labels.
+    """
+    # Load the dataset
+    data, info = tfds.load('the300w_lp', split='train', shuffle_files=True, with_info=True, data_dir='../../data/300w')
+
+    # Extract images and landmarks
+    images = []
+    landmarks = []
+    for example in tfds.as_numpy(data):
+        images.append(example['image'])
+        landmarks.append(example['landmarks_2d'])
+
+    images = np.array(images)
+    landmarks = np.array(landmarks)
+
+    # Splitting into training and validation sets
+    print("splitting...")
+    train_x, valid_x, train_y, valid_y = train_test_split(images, landmarks, test_size=0.1)
+    print("splitting complete")
+
+    return train_x, train_y, valid_x, valid_y
+
 
 # Define the head pose estimation model
 class HPENet(nn.Module):
@@ -149,9 +176,50 @@ def distill_train(student_model, teacher_models, dataloader, optimizer, device):
     return total_loss / len(dataloader)
 
 
-train_dataset = TensorFlow300WLPDataset(data, transform=train_transform)
+# Evaluation function
+def evaluate(model, dataloader, device):
+    model.eval()
+    total_loss = 0
+    with torch.no_grad():
+        for images, labels in dataloader:
+            images = images.to(device)
+            yaw_true, pitch_true, roll_true = labels[:, 0].long(), labels[:, 1].long(), labels[:, 2].long()
+            yaw_true, pitch_true, roll_true = yaw_true.to(device), pitch_true.to(device), roll_true.to(device)
+
+            yaw_pred, pitch_pred, roll_pred = model(images)
+            loss = head_pose_loss(yaw_pred, pitch_pred, roll_pred, yaw_true, pitch_true, roll_true)
+            total_loss += loss.item()
+
+    return total_loss / len(dataloader)
+
+# Load AFLW-2000 dataset
+def load_aflw2000():
+    # Implement code to load AFLW-2000 dataset
+    # Return test_x and test_y
+    pass
+
+# Load BIWI dataset
+def load_biwi():
+    # Implement code to load BIWI dataset
+    # Return test_x and test_y
+    pass
+
+
+train_x, train_y, valid_x, valid_y = load_300w_train()
+train_dataset = TensorFlow300WLPDataset(list(zip(train_x, train_y)), transform=train_transform)
 train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
 
+valid_dataset = TensorFlow300WLPDataset(list(zip(valid_x, valid_y)), transform=transforms.ToTensor())
+valid_loader = DataLoader(valid_dataset, batch_size=64, shuffle=False)
+
+# Load test datasets
+aflw2000_test_x, aflw2000_test_y = load_aflw2000()
+aflw2000_test_dataset = TensorFlow300WLPDataset(list(zip(aflw2000_test_x, aflw2000_test_y)), transform=transforms.ToTensor())
+aflw2000_test_loader = DataLoader(aflw2000_test_dataset, batch_size=64, shuffle=False)
+
+biwi_test_x, biwi_test_y = load_biwi()
+biwi_test_dataset = TensorFlow300WLPDataset(list(zip(biwi_test_x, biwi_test_y)), transform=transforms.ToTensor())
+biwi_test_loader = DataLoader(biwi_test_dataset, batch_size=64, shuffle=False)
 
 # Create the teacher models
 teacher_model1 = HPENet().to('cuda')
@@ -167,7 +235,15 @@ for epoch in range(100):
     train_loss1 = train(teacher_model1, train_loader, optimizer1, 'cuda')
     train_loss2 = train(teacher_model2, train_loader, optimizer2, 'cuda')
     train_loss3 = train(teacher_model3, train_loader, optimizer3, 'cuda')
-    print(f"Epoch [{epoch+1}/100], Teacher 1 Loss: {train_loss1:.4f}, Teacher 2 Loss: {train_loss2:.4f}, Teacher 3 Loss: {train_loss3:.4f}")
+    
+    # Evaluate on the validation set
+    valid_loss1 = evaluate(teacher_model1, valid_loader, 'cuda')
+    valid_loss2 = evaluate(teacher_model2, valid_loader, 'cuda')
+    valid_loss3 = evaluate(teacher_model3, valid_loader, 'cuda')
+    
+    print(f"Epoch [{epoch+1}/100], Teacher 1 Train Loss: {train_loss1:.4f}, Valid Loss: {valid_loss1:.4f}")
+    print(f"Epoch [{epoch+1}/100], Teacher 2 Train Loss: {train_loss2:.4f}, Valid Loss: {valid_loss2:.4f}")
+    print(f"Epoch [{epoch+1}/100], Teacher 3 Train Loss: {train_loss3:.4f}, Valid Loss: {valid_loss3:.4f}")
 
 # Save the trained teacher models
 save_model(teacher_model1, 'teacher_model1.pth')
@@ -182,7 +258,18 @@ optimizer = optim.Adam(student_model.parameters(), lr=1e-4)
 teacher_models = [teacher_model1, teacher_model2, teacher_model3]
 for epoch in range(200):
     distill_loss = distill_train(student_model, teacher_models, train_loader, optimizer, 'cuda')
-    print(f"Epoch [{epoch+1}/200], Distill Loss: {distill_loss:.4f}")
+    
+    # Evaluate on the validation set
+    valid_loss = evaluate(student_model, valid_loader, 'cuda')
+    
+    print(f"Epoch [{epoch+1}/200], Distill Train Loss: {distill_loss:.4f}, Valid Loss: {valid_loss:.4f}")
 
 # Save the trained student model
 save_model(student_model, 'HPENet.pth')
+
+# Evaluate on test datasets
+aflw2000_test_loss = evaluate(student_model, aflw2000_test_loader, 'cuda')
+biwi_test_loss = evaluate(student_model, biwi_test_loader, 'cuda')
+
+print(f"AFLW-2000 Test Loss: {aflw2000_test_loss:.4f}")
+print(f"BIWI Test Loss: {biwi_test_loss:.4f}")
